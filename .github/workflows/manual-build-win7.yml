@@ -1,0 +1,188 @@
+name: Manual Build for win7
+
+on:
+  workflow_dispatch:
+    inputs:
+      git_ref:
+        description: |
+          Target Commit SHA, Tag, or Branch to build (Leave blank for latest, see Notes below). Selected commit must have this workflow otherwise the latest commit will be built instead of the one you put here:
+        required: false
+        default: ''
+
+      platform:
+        description: 'Select Target Architecture:'
+        required: true
+        type: choice
+        default: 'x64'
+        options:
+          - 'Win32'
+          - 'x64'
+          - 'x64_AVX2'
+          - 'ARM64'
+
+      Note1:
+        description: |
+          - Note1: The GitHub Actions summary page has a visual limitation: the header banner, run title, and commit badge always display the latest commit of the triggering branch, regardless of what happens inside the runner. Even if actions/checkout successfully pulls down your specific commit SHA and switches your codebase back in time, the top of the GitHub UI will still show the latest commit hash. 
+          The Fix: To prove exactly what code is being built, I added a quick verification step immediately after the checkout step to log the real HEAD, and the final zip will contain the commit ref too.
+        required: false
+        default: ''
+        
+      Note2:
+        description: |
+          - Note2: When you trigger a workflow manually via workflow_dispatch, GitHub reads the workflow YAML file strictly from the branch selected in the "Use workflow from" dropdown.
+          If your new configuration changes (the ones handling the git_ref input) are currently sitting on a feature branch and haven't been merged to main yet, leaving that dropdown on main will cause GitHub to execute the old version of your workflow. The old version has no idea the input box exists, so it completely ignores whatever you typed and builds the latest commit of main.
+          The Fix: Ensure the "Use workflow from" dropdown matches the exact branch where your updated workflow file lives.
+        required: false
+        default: ''
+
+jobs:
+  build:
+    name: ${{ github.event.inputs.platform }} Release
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout Custom Ref
+        if: github.event.inputs.git_ref != ''
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.git_ref }}
+          fetch-depth: 0
+
+      - name: Checkout Default
+        if: github.event.inputs.git_ref == ''
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get Actual Commit SHA
+        shell: bash
+        run: |
+          echo "REAL_SHA=$(git rev-parse HEAD)" >> $GITHUB_ENV
+          echo "SHORT_SHA=$(git rev-parse --short=8 HEAD)" >> $GITHUB_ENV
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Setup NuGet
+        uses: nuget/setup-nuget@v2
+
+      - name: Restore NuGet packages
+        run: nuget restore Notepad3.sln -Verbosity detailed
+
+      - name: Generate version
+        shell: pwsh
+        run: |
+          $env:GITHUB_ACTIONS_BUILD = "true"
+          # Use the environment variable we captured dynamically via bash
+          $CommitID = $env:SHORT_SHA
+
+          # Create VersionEx.h with proper values
+          $Major = 6
+          $Minor = [int]$(Get-Date -format yy)
+          $Revis = [int]$(Get-Date -format Mdd)
+          $Build = ${{ github.run_number }}
+
+          $SciVer = Get-Content "scintilla\version.txt" -ErrorAction SilentlyContinue
+          if (!$SciVer) { $SciVer = "0" }
+          $LxiVer = Get-Content "lexilla\version.txt" -ErrorAction SilentlyContinue
+          if (!$LxiVer) { $LxiVer = "0" }
+          $PCRE2Ver = Get-Content "scintilla\pcre2\version.txt" -ErrorAction SilentlyContinue
+          if (!$PCRE2Ver) { $PCRE2Ver = "0.0" }
+          $UChardetVer = Get-Content "src\uchardet\version.txt" -ErrorAction SilentlyContinue
+          if (!$UChardetVer) { $UChardetVer = "0.0.0" }
+          $TinyExprVer = Get-Content "src\tinyexpr\version.txt" -ErrorAction SilentlyContinue
+          if (!$TinyExprVer) { $TinyExprVer = "0.0.0" }
+          $UtHashVer = Get-Content "src\uthash\version.txt" -ErrorAction SilentlyContinue
+          if (!$UtHashVer) { $UtHashVer = "0.0.0" }
+
+          Copy-Item -LiteralPath "Versions\VersionEx.h.tpl" -Destination "src\VersionEx.h" -Force
+          $content = Get-Content "src\VersionEx.h" -Raw
+          $content = $content -replace '\$APPNAME\$', "Notepad3"
+          $content = $content -replace '\$MAJOR\$', "$Major"
+          $content = $content -replace '\$MINOR\$', "$Minor"
+          $content = $content -replace '\$MAINT\$', "$Revis"
+          $content = $content -replace '\$BUILD\$', "$Build"
+          $content = $content -replace '\$SCIVER\$', "$SciVer"
+          $content = $content -replace '\$LXIVER\$', "$LxiVer"
+          $content = $content -replace '\$PCRE2VER\$', "$PCRE2Ver"
+          $content = $content -replace '\$UCHARDETVER\$', "$UChardetVer"
+          $content = $content -replace '\$TINYEXPRVER\$', "$TinyExprVer"
+          $content = $content -replace '\$UTHASHVER\$', "$UtHashVer"
+          $content = $content -replace '\$VERPATCH\$', ""
+          $content = $content -replace '\$COMMITID\$', "$CommitID"
+          Set-Content -Path "src\VersionEx.h" -Value $content -NoNewline
+
+          $ConfManifest = "res\Notepad3.exe.conf.manifest"
+          Copy-Item -LiteralPath "Versions\Notepad3.exe.manifest.tpl" -Destination $ConfManifest -Force
+          $content = Get-Content $ConfManifest -Raw
+          $content = $content -replace '\$APPNAME\$', "Notepad3"
+          $content = $content -replace '\$VERPATCH\$', ""
+          $content = $content -replace '\$VERSION\$', "$Major.$Minor.$Revis.$Build"
+          Set-Content -Path $ConfManifest -Value $content -NoNewline
+
+          # Persist build number for TestFileVersion.cmd
+          $Build | Set-Content -Path "Versions\build.txt" -NoNewline
+
+          Write-Host "Version: $Major.$Minor.$Revis.$Build ($CommitID)"
+
+      - name: Build
+        shell: pwsh
+        run: |
+          $platform = "${{ github.event.inputs.platform }}"
+          $config = "Release"
+
+          # Handle x64_AVX2 - use native Release_AVX2 configuration
+          if ($platform -eq "x64_AVX2") {
+            $platform = "x64"
+            $config = "Release_AVX2"
+          }
+
+          msbuild Notepad3.sln /m /p:Configuration=$config /p:Platform=$platform /v:minimal
+
+      - name: Install AutoHotkey
+        if: github.event.inputs.platform == 'Win32' || github.event.inputs.platform == 'x64'
+        run: choco install autohotkey.install --no-progress -y
+
+      - name: Run tests
+        if: github.event.inputs.platform == 'Win32' || github.event.inputs.platform == 'x64'
+        shell: cmd
+        working-directory: test
+        run: |
+          call TestFileVersion.cmd
+          call TestAhkNotepad3.cmd
+
+      - name: Stage artifact files
+        shell: pwsh
+        run: |
+          # Create a clean temporary staging directory
+          New-Item -ItemType Directory -Force -Path .\StagingOut | Out-Null
+          
+          # 1. Copy the entire Bin directory structure to staging root
+          Copy-Item -Path .\Bin\* -Destination .\StagingOut\ -Recurse -Force
+          
+          # 2. Identify the dynamic MSBuild output folder (e.g., Release_x64_v143)
+          $outDir = Get-ChildItem -Path .\StagingOut -Directory | Where-Object Name -match 'Release|Debug' | Select-Object -First 1
+          
+          # 3. Clean up exclusions inside the output folder
+          Get-ChildItem -Path $outDir.FullName -Recurse -Directory | Where-Object Name -eq 'obj' | Remove-Item -Recurse -Force
+          Get-ChildItem -Path $outDir.FullName -Recurse -File -Include *.pdb,*.iobj,*.ipdb,*.lib,*.exp | Remove-Item -Force
+
+          # 4. Copy text assets and configs directly INTO the dynamic output folder
+          foreach ($file in @("License.txt", "Readme.txt", ".\Build\Notepad3.ini", ".\Build\minipath.ini", ".\grepWinNP3\grepWinLicense.txt")) {
+              if (Test-Path $file) { Copy-Item -Path $file -Destination $outDir.FullName -Force }
+          }
+
+          # 5. Copy asset directories INTO the dynamic output folder
+          foreach ($folder in @(".\Build\Themes", ".\Build\Docs")) {
+              if (Test-Path $folder) { Copy-Item -Path $folder -Destination $outDir.FullName -Recurse -Force }
+          }
+
+          # 6. Create Favorites folder inside the dynamic output folder
+          New-Item -ItemType Directory -Force -Path "$($outDir.FullName)\Favorites" | Out-Null
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Notepad3-${{ github.event.inputs.platform }}-Release_${{ env.SHORT_SHA }}
+          path: .\StagingOut\
+          retention-days: 30
