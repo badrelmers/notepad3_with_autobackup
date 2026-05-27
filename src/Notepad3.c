@@ -31,6 +31,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <process.h>
+#include <time.h>
 #include <vsstyle.h>
 //#include <ShellScalingApi.h>
 
@@ -11400,6 +11401,275 @@ static LONG _UndoRedoActionMap(const LONG token, const UndoRedoSelection_t** sel
 }
 
 
+//  AutoBackup - Pre-Save and Post-Save backup logic.
+//
+//  Two entry points called from FileIO():
+//    AutoBackup_PreSave()  - snapshot the existing on-disk file BEFORE overwrite
+//    AutoBackup_PostSave() - write a rolling .bak and a drive-root mirror AFTER
+//
+//  Both are skipped for FSF_SaveCopy operations (backing up a deliberate copy
+//  is redundant and would produce misleading artefacts in the .bckp folder).
+//
+
+// ---------------------------------------------------------------------------
+// 10-second per-file throttle for pre-save snapshots.
+//
+// Implemented as a fixed-size ring buffer of (path, time_t) pairs.
+// Linear scan over AUTOBACKUP_THROTTLE_SLOTS entries is O(1) in practice
+// (users rarely save more than a handful of distinct files within 10 s).
+// ---------------------------------------------------------------------------
+#define AUTOBACKUP_THROTTLE_SLOTS 8
+
+typedef struct {
+    WCHAR  szPath[MAX_PATH]; // lower-cased canonical path
+    time_t tLastBackup;
+} AutoBackupThrottleEntry;
+
+static AutoBackupThrottleEntry s_abThrottle[AUTOBACKUP_THROTTLE_SLOTS];
+static int                     s_abNextSlot = 0;  // ring-buffer write cursor
+
+#define AUTOBACKUP_THROTTLE_SEC  10
+
+// ---------------------------------------------------------------------------
+// AutoBackup_EnsureHiddenDir
+//
+// Creates pszDir if absent, then stamps FILE_ATTRIBUTE_HIDDEN on it.
+// Returns false and pops a MessageBox on failure.
+// ---------------------------------------------------------------------------
+static bool AutoBackup_EnsureHiddenDir(LPCWSTR pszDir)
+{
+    DWORD dwAttr = GetFileAttributesW(pszDir);
+    if (dwAttr == INVALID_FILE_ATTRIBUTES) {
+        if (!CreateDirectoryW(pszDir, NULL)) {
+            WCHAR msg[MAX_PATH + 160];
+            StringCchPrintf(msg, COUNTOF(msg),
+                L"Auto Backup: failed to create backup directory.\n\n%s\n\nError code: %lu",
+                pszDir, GetLastError());
+            MessageBoxW(Globals.hwndMain, msg, L"Auto Backup Error", MB_OK | MB_ICONWARNING);
+            return false;
+        }
+        dwAttr = GetFileAttributesW(pszDir);
+    }
+    // Unconditionally stamp hidden; tolerate failure on read-only filesystems.
+    if ((dwAttr != INVALID_FILE_ATTRIBUTES) && !(dwAttr & FILE_ATTRIBUTE_HIDDEN)) {
+        SetFileAttributesW(pszDir, dwAttr | FILE_ATTRIBUTE_HIDDEN);
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// AutoBackup_CreateDirRecursive
+//
+// Creates every missing directory component of pszPath without COM/shell.
+// ---------------------------------------------------------------------------
+static bool AutoBackup_CreateDirRecursive(LPCWSTR pszPath)
+{
+    if (CreateDirectoryW(pszPath, NULL)) {
+        return true;
+    }
+    DWORD const err = GetLastError();
+    if (err == ERROR_ALREADY_EXISTS) {
+        return true;
+    }
+    if (err != ERROR_PATH_NOT_FOUND) {
+        return false; // unrecoverable
+    }
+    // Recurse into parent.
+    WCHAR szParent[MAX_PATH];
+    StringCchCopy(szParent, COUNTOF(szParent), pszPath);
+    PathRemoveFileSpecW(szParent);
+    if (lstrcmpW(szParent, pszPath) == 0) {
+        return false; // already at root
+    }
+    if (!AutoBackup_CreateDirRecursive(szParent)) {
+        return false;
+    }
+    return CreateDirectoryW(pszPath, NULL) || (GetLastError() == ERROR_ALREADY_EXISTS);
+}
+
+// ---------------------------------------------------------------------------
+// AutoBackup_PreSave
+//
+// Called BEFORE EditSaveFile() writes new content to disk.
+// Copies the current on-disk file to:
+//   <dir>\.bckp\<filename>.<YYYYMMDD_HHMMSS>
+//
+// Skipped when:
+//   * the file does not yet exist on disk (first save / Save As to new path)
+//   * a snapshot for this file was taken less than 10 s ago
+//   * the save is a SaveCopy
+// ---------------------------------------------------------------------------
+static void AutoBackup_PreSave(LPCWSTR pszFile, FileSaveFlags fSaveFlags)
+{
+    if (fSaveFlags & FSF_SaveCopy) {
+        return;
+    }
+
+    // Skip if nothing on disk to snapshot yet.
+    if (GetFileAttributesW(pszFile) == INVALID_FILE_ATTRIBUTES) {
+        return;
+    }
+
+    // Build a lower-cased key for case-insensitive FS comparison.
+    WCHAR szKey[MAX_PATH];
+    StringCchCopy(szKey, COUNTOF(szKey), pszFile);
+    CharLowerW(szKey);
+
+    // 10-second throttle: scan the ring buffer for this path.
+    time_t const now = time(NULL);
+    for (int i = 0; i < AUTOBACKUP_THROTTLE_SLOTS; ++i) {
+        if (lstrcmpW(s_abThrottle[i].szPath, szKey) == 0) {
+            if ((now - s_abThrottle[i].tLastBackup) < AUTOBACKUP_THROTTLE_SEC) {
+                return; // last snapshot was less than 10 s ago
+            }
+            break; // found the entry but it's stale - proceed with backup
+        }
+    }
+
+    // Build .bckp directory path alongside the file.
+    WCHAR szFileDir[MAX_PATH];
+    StringCchCopy(szFileDir, COUNTOF(szFileDir), pszFile);
+    PathRemoveFileSpecW(szFileDir);
+
+    WCHAR szBckpDir[MAX_PATH];
+    PathCombineW(szBckpDir, szFileDir, L".bckp");
+
+    if (!AutoBackup_EnsureHiddenDir(szBckpDir)) {
+        return; // error already reported
+    }
+
+    // Timestamped backup name: <filename>.<YYYYMMDD_HHMMSS>
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    WCHAR szTimestamp[24];
+    StringCchPrintf(szTimestamp, COUNTOF(szTimestamp), L"%04hu%02hu%02hu_%02hu%02hu%02hu",
+        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+
+    WCHAR szBackupName[MAX_PATH];
+    StringCchPrintf(szBackupName, COUNTOF(szBackupName),
+        L"%s.%s", PathFindFileNameW(pszFile), szTimestamp);
+
+    WCHAR szDest[MAX_PATH];
+    PathCombineW(szDest, szBckpDir, szBackupName);
+
+    if (!CopyFileW(pszFile, szDest, FALSE)) {
+        WCHAR msg[MAX_PATH + 160];
+        StringCchPrintf(msg, COUNTOF(msg),
+            L"Auto Backup: failed to create pre-save snapshot.\n\n%s\n\nError code: %lu",
+            szDest, GetLastError());
+        MessageBoxW(Globals.hwndMain, msg, L"Auto Backup Error", MB_OK | MB_ICONWARNING);
+        return;
+    }
+
+    // Snapshot succeeded - update or insert the throttle entry.
+    int targetSlot = s_abNextSlot; // default: evict oldest via ring cursor
+    for (int i = 0; i < AUTOBACKUP_THROTTLE_SLOTS; ++i) {
+        if (lstrcmpW(s_abThrottle[i].szPath, szKey) == 0) {
+            targetSlot = i; // update existing entry in-place
+            break;
+        }
+    }
+    StringCchCopy(s_abThrottle[targetSlot].szPath, COUNTOF(s_abThrottle[targetSlot].szPath), szKey);
+    s_abThrottle[targetSlot].tLastBackup = now;
+    // Only advance the ring cursor when we consumed a new slot (not an update).
+    if (targetSlot == s_abNextSlot) {
+        s_abNextSlot = (s_abNextSlot + 1) % AUTOBACKUP_THROTTLE_SLOTS;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AutoBackup_PostSave
+//
+// Called AFTER EditSaveFile() has successfully written pszFile to disk.
+// Performs two independent backup actions:
+//
+//   1. Rolling .bak  - copies the new file to <dir>\.bckp\<filename>.bak
+//                      (overwrites any previous .bak for this file)
+//
+//   2. Drive-root mirror - copies the new file to
+//                          <drive>:\_#\<path-relative-to-drive-root>
+//                          e.g. C:\foo\bar.txt -> C:\_#\foo\bar.txt
+//                          Skipped for UNC paths (\\server\share\...).
+//
+// Skipped entirely for FSF_SaveCopy operations.
+// ---------------------------------------------------------------------------
+static void AutoBackup_PostSave(LPCWSTR pszFile, FileSaveFlags fSaveFlags)
+{
+    if (fSaveFlags & FSF_SaveCopy) {
+        return;
+    }
+
+    // ---- 1. Rolling .bak backup ----------------------------------------
+    WCHAR szFileDir[MAX_PATH];
+    StringCchCopy(szFileDir, COUNTOF(szFileDir), pszFile);
+    PathRemoveFileSpecW(szFileDir);
+
+    WCHAR szBckpDir[MAX_PATH];
+    PathCombineW(szBckpDir, szFileDir, L".bckp");
+
+    // EnsureHiddenDir is called again here: pre-save may have been skipped
+    // (e.g. first-ever save), so the directory may not exist yet.
+    if (AutoBackup_EnsureHiddenDir(szBckpDir)) {
+        WCHAR szBakName[MAX_PATH];
+        StringCchPrintf(szBakName, COUNTOF(szBakName),
+            L"%s.bak", PathFindFileNameW(pszFile));
+
+        WCHAR szBakDest[MAX_PATH];
+        PathCombineW(szBakDest, szBckpDir, szBakName);
+
+        if (!CopyFileW(pszFile, szBakDest, FALSE)) {
+            WCHAR msg[MAX_PATH + 160];
+            StringCchPrintf(msg, COUNTOF(msg),
+                L"Auto Backup: failed to create rolling .bak backup.\n\n%s\n\nError code: %lu",
+                szBakDest, GetLastError());
+            MessageBoxW(Globals.hwndMain, msg, L"Auto Backup Error", MB_OK | MB_ICONWARNING);
+            // Non-fatal: continue to attempt the mirror backup below.
+        }
+    }
+
+    // ---- 2. Drive-root mirror backup ------------------------------------
+    // UNC paths (\\server\share\...) have no single drive root - skip them.
+    if (pszFile[0] == L'\\' && pszFile[1] == L'\\') {
+        return;
+    }
+    // Require a classic "X:\" absolute path.
+    if (pszFile[1] != L':' || pszFile[2] != L'\\') {
+        return;
+    }
+
+    // Mirror root: "X:\_#"  (e.g. "C:\_#")
+    WCHAR szMirrorRoot[8];
+    StringCchPrintf(szMirrorRoot, COUNTOF(szMirrorRoot), L"%c%c\\_#", pszFile[0], pszFile[1]);
+
+    // Full mirror path: szMirrorRoot + everything after "X:" in pszFile.
+    // pszFile + 2  ==  "\path\to\file.txt"
+    // szMirrorPath ==  "X:\_#\path\to\file.txt"
+    WCHAR szMirrorPath[MAX_PATH];
+    StringCchPrintf(szMirrorPath, COUNTOF(szMirrorPath), L"%s%s", szMirrorRoot, pszFile + 2);
+
+    // Create the mirror's parent directory tree.
+    WCHAR szMirrorDir[MAX_PATH];
+    StringCchCopy(szMirrorDir, COUNTOF(szMirrorDir), szMirrorPath);
+    PathRemoveFileSpecW(szMirrorDir);
+
+    if (!AutoBackup_CreateDirRecursive(szMirrorDir)) {
+        WCHAR msg[MAX_PATH + 160];
+        StringCchPrintf(msg, COUNTOF(msg),
+            L"Auto Backup: failed to create drive-root mirror directory.\n\n%s\n\nError code: %lu",
+            szMirrorDir, GetLastError());
+        MessageBoxW(Globals.hwndMain, msg, L"Auto Backup Error", MB_OK | MB_ICONWARNING);
+        return;
+    }
+
+    if (!CopyFileW(pszFile, szMirrorPath, FALSE)) {
+        WCHAR msg[MAX_PATH + 160];
+        StringCchPrintf(msg, COUNTOF(msg),
+            L"Auto Backup: failed to write drive-root mirror backup.\n\n%s\n\nError code: %lu",
+            szMirrorPath, GetLastError());
+        MessageBoxW(Globals.hwndMain, msg, L"Auto Backup Error", MB_OK | MB_ICONWARNING);
+    }
+}
+
 //=============================================================================
 //
 //  FileIO()
@@ -11429,7 +11699,15 @@ bool FileIO(bool fLoad, const HPATHL hfile_pth, EditFileIOStatus* status,
             }
             Globals.pFileMRU->pszBookMarks[idx] = StrDup(wchBookMarks);
         }
+        // ---- Auto Backup: pre-save snapshot of the existing on-disk file ----
+        AutoBackup_PreSave(Path_Get(hfile_pth), fSaveFlags);
+
         bSuccess = EditSaveFile(Globals.hwndEdit, hfile_pth, status, fSaveFlags, Flags.bPreserveFileModTime);
+
+        // ---- Auto Backup: post-save rolling .bak + drive-root mirror --------
+        if (bSuccess) {
+            AutoBackup_PostSave(Path_Get(hfile_pth), fSaveFlags);
+        }
     }
     return bSuccess;
 }
