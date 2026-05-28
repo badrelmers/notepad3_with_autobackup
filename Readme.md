@@ -1,3 +1,52 @@
+
+# Notepad3 with AutoBackup
+
+This is a personal fork to add some personal preferences and i have no intention to maintain it or update it
+
+I support only win7
+
+Things i added/changed:
+### Add Auto Backup on Save
+  - on pre save:
+      - timestamped snapshot  (<file>.<YYYYMMDD_HHMMSS>) in .bckp/ folder (skipped when last backup is less than 10 seconds ago)
+  - on post save:
+      - rolling .bak          (<file>.bak)                in .bckp/ folder
+      - drive-mirror copy     (drive:\_#\original\path)
+
+It does the following every time you save a file:
+- Backup 1 (.bckp Folder):
+    - It copies the file into a subfolder named .bckp next to your file.
+    - It creates (or updates) a non timestamped backup that overwrites the previous backup.
+    - In addition, it also creates a timestamped copy (with the timestamp inserted before the extension) so you have a history of changes.
+    - Mark the backup folder as hidden
+    
+- Backup 2 (Drive Root “_#” Backup on Windows):
+    - It creates a copy in a drive-root backup folder. This backup mirrors the directory structure of your file on the drive under an _# folder.  Example: If the file being saved is `C:\Projects\main.cpp`, the mirrored backup is copied to `C:\_#\Projects\main.cpp`.
+
+### change shortcuts to my preference
+by default this was the shortcuts:
+- Ctrl+Shift+Q          Stream Comment.
+- Ctrl+Q                Toggle.
+- Ctrl+Alt+Q            Add.
+- Ctrl+Alt+Shift+Q      Remove.
+- Alt+Shift+Q           Block Edit.
+- Alt+ ↑                Move Line (Block) Up.
+- Alt+ ↓                Move Line (Block) Down.
+
+Things i changed:
+- IDM_EDIT_MOVELINEUP     Alt+Up     is now   ctrl+shift+up
+- IDM_EDIT_MOVELINEDOWN   Alt+Down   is now   ctrl+shift+down
+
+### branches difference
+there is 2 branches with the same above changes:
+- **notepad3_with_autobackup_win7__based_on_bugfix_Win7_branch**: this use the latest commit in the bugfix_Win7 branch but it have a small bug, sometimes crash when i drag and drop to the same window several times!
+
+- **notepad3_with_autobackup_win7__based_on_Notepad3_6.26.130.1_beta**: this use the latest version the original author officially built and published here https://github.com/rizonesoft/Notepad3/issues/1129, it is 5 or 4 months older than the bugfix_Win7 version but it does not have the above bug
+
+by Badr Elmers
+
+_____________________________________________________________
+
 # Notepad3
 
 **A fast, lightweight, Scintilla-based text editor for Windows**
